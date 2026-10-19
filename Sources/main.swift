@@ -14,6 +14,31 @@ struct Post: Codable, Identifiable {
         let text = (title + " " + category).lowercased()
         return text.contains("reset") || text.contains("credit") || text.contains("额度") || text.contains("重置")
     }
+    var isPlanned: Bool { category.lowercased().contains("planned") }
+    var announcementSoundName: String? {
+        if isPlanned { return "reset-planned" }
+        return isConfirmedCompletion ? "reset-confirmed" : nil
+    }
+    var expectedTimeText: String {
+        let source = body.components(separatedBy:"Source text:").last?.components(separatedBy:"\n\nSource:").first ?? ""
+        let pattern = "(?i)\\bwithin\\s+(?:the\\s+next\\s+)?([0-9]{1,2})\\s+hours?\\b"
+        let regex = try! NSRegularExpression(pattern:pattern)
+        if let match = regex.firstMatch(in:source,range:NSRange(source.startIndex...,in:source)),
+           let r = Range(match.range(at:1),in:source), let hours = Int(source[r]), hours > 0, hours <= 48 {
+            let expected = date.addingTimeInterval(Double(hours)*3600)
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier:"zh_CN")
+            formatter.timeZone = TimeZone(identifier:"Asia/Shanghai")
+            formatter.dateFormat = "M月d日 HH:mm"
+            return "原帖预计发布后 \(hours) 小时内，即北京时间 \(formatter.string(from:expected)) 前；这是预估窗口。"
+        }
+        let lower = source.lowercased()
+        if lower.contains("eod") || lower.contains("end of day") {
+            let zone = lower.contains("pst") ? "（原帖时区标为 PST）" : "（原帖未明确时区）"
+            return "原帖预计在发布当天结束前重置\(zone)，未给出精确时刻。"
+        }
+        return "原帖未给出可精确换算的预计时刻，请点击查看时间安排。"
+    }
     var isConfirmedCompletion: Bool {
         let c = category.lowercased()
         return c.contains("completed") && !c.contains("planned")
@@ -21,7 +46,7 @@ struct Post: Codable, Identifiable {
     var notificationBody: String {
         let c = category.lowercased()
         if c.contains("planned") {
-            return "Tibo 预告将重置 Codex 额度，目前尚未确认完成。请点击查看原帖中的时间安排。"
+            return "Tibo 预告将重置 Codex 额度，目前尚未确认完成。\n" + expectedTimeText
         }
         if isConfirmedCompletion {
             return "Tibo 已宣布 Codex 额度重置完成。请查看你的账户确认是否到账，点击可查看原帖。"
@@ -160,6 +185,7 @@ struct ReminderView: View {
     }
     @Published var audioMessage = ""
     private let reminders = ReminderPresenter()
+    private var voiceAssetName: String?
     private var voiceProcess: Process?
     private var timer: Timer?
     private let defaults = UserDefaults.standard
@@ -191,7 +217,7 @@ struct ReminderView: View {
         let isTest = post.id.hasPrefix("test-")
         content.title = (isTest ? "【测试】" : "") + "Tibo · \(post.kind)"
         content.body = (isTest ? "这是一条模拟通知，并非新的重置消息。\n" : "") + post.notificationBody
-        let spoken = post.isConfirmedCompletion && voiceEnabled
+        let spoken = post.announcementSoundName != nil && voiceEnabled
         content.sound = spoken ? nil : .default
         content.userInfo = ["url":post.url.absoluteString]
         let center = UNUserNotificationCenter.current()
@@ -201,8 +227,11 @@ struct ReminderView: View {
         if spoken, settings.authorizationStatus == .authorized, settings.soundSetting == .enabled {
             // Use the media output path tested on this Mac. Coalesce simultaneous
             // completion announcements so the same phrase cannot overlap itself.
-            if let process = voiceProcess, process.isRunning { return }
-            guard let url = Bundle.main.url(forResource:"reset-confirmed",withExtension:"caf") else {
+            if let process = voiceProcess, process.isRunning {
+                if voiceAssetName == post.announcementSoundName { return }
+                process.terminate()
+            }
+            guard let name = post.announcementSoundName, let url = Bundle.main.url(forResource:name,withExtension:"caf") else {
                 audioMessage = "中文播报文件缺失"
                 return
             }
@@ -212,11 +241,12 @@ struct ReminderView: View {
             do {
                 try process.run()
                 voiceProcess = process
+                voiceAssetName = post.announcementSoundName
                 audioMessage = ""
             } catch { audioMessage = "中文播报失败：\(error.localizedDescription)" }
         }
     }
-    func test() async {
+    func test(planned: Bool = false) async {
         await allow()
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
@@ -228,10 +258,11 @@ struct ReminderView: View {
             "soundSetting": settings.soundSetting.rawValue,
             "notificationCenterSetting": settings.notificationCenterSetting.rawValue,
             "alertStyle": settings.alertStyle.rawValue,
+            "kind": planned ? "planned" : "completed",
             "identifier": identifier
         ]
         do {
-            try await notify(Post(id:identifier, title:"这是一条 Tibo Watch 测试通知，点击可打开 Tibo 主页。",body:"",category:"Reset Completed",date:Date(),url:URL(string:"https://x.com/thsottiaux")!))
+            try await notify(Post(id:identifier, title:"这是一条 Tibo Watch 测试通知，点击可打开 Tibo 主页。",body:planned ? "Source text: Landing within the next 2 hours" : "",category:planned ? "Reset Planned" : "Reset Completed",date:Date(),url:URL(string:"https://x.com/thsottiaux")!))
             report["submitted"] = true
             report["textWindowVisible"] = reminders.isVisible
             report["voiceEnabled"] = voiceEnabled
@@ -345,7 +376,10 @@ struct Panel: View {
                 Text("包含计划与完成消息；不代表你的账户额度已到账。休眠期间停止检查，唤醒后补查。").font(.caption).foregroundStyle(.secondary)
             }
             HStack {
-                Button("测试通知") { Task { await model.test() } }
+                Menu("测试提醒") {
+                    Button("预计重置（计划）") { Task { await model.test(planned:true) } }
+                    Button("已宣布完成") { Task { await model.test() } }
+                }.fixedSize()
                 Button(model.paused ? "继续" : "暂停") { model.paused.toggle(); if !model.paused { Task { await model.check() } } }
                 Spacer()
                 Menu {
@@ -387,7 +421,8 @@ struct Panel: View {
         popover.contentViewController = NSHostingController(rootView:Panel(model:model))
         model.start()
         Task {
-            if CommandLine.arguments.contains("--test-notification") { await model.test() }
+            if CommandLine.arguments.contains("--test-planned-notification") { await model.test(planned:true) }
+            else if CommandLine.arguments.contains("--test-notification") { await model.test() }
             else { await model.allow() }
         }
         toggle()
@@ -406,10 +441,16 @@ struct Panel: View {
 if CommandLine.arguments.contains("--check-notification-copy") {
     for category in ["Reset Planned", "Reset Completed", "Banked Reset", "Reset Discussion", "Reset Planned Completed"] {
         let post = Post(id:"check",title:category == "Banked Reset" ? "banked" : "update",body:"",category:category,date:Date(),url:URL(string:"https://x.com/thsottiaux")!)
-        if category.contains("Planned") { precondition(!post.isConfirmedCompletion && post.notificationBody.contains("尚未确认完成")) }
+        if category.contains("Planned") { precondition(!post.isConfirmedCompletion && post.notificationBody.contains("尚未确认完成") && post.announcementSoundName == "reset-planned") }
         if category == "Reset Completed" { precondition(post.isConfirmedCompletion && post.notificationBody.contains("确认是否到账")) }
         print("\(post.kind)：\(post.notificationBody)")
     }
+    let referenceDate = Date(timeIntervalSince1970:0)
+    let relative = Post(id:"check",title:"plan",body:"Source text: Landing within the next 2 hours",category:"Reset Planned",date:referenceDate,url:URL(string:"https://x.com/thsottiaux")!)
+    precondition(relative.expectedTimeText.contains("1月1日 10:00"))
+    let eod = Post(id:"check",title:"plan",body:"Source text: Landing sometime today by EOD PST",category:"Reset Planned",date:referenceDate,url:relative.url)
+    precondition(eod.expectedTimeText.contains("PST") && !eod.expectedTimeText.contains("北京时间"))
+    print("预计时间转换与模糊时区边界检查通过")
 } else if CommandLine.arguments.contains("--check-feed") {
     let data = try Data(contentsOf:URL(fileURLWithPath:CommandLine.arguments.last!))
     let posts = try FeedParser.parse(data)

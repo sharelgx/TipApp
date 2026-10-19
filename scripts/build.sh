@@ -5,6 +5,7 @@ APP="$PWD/dist/Tibo Watch.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist/Tibo.iconset
 cp Assets/tibo-avatar.jpg "$APP/Contents/Resources/tibo-avatar.jpg"
 cp Assets/audio/reset-confirmed.caf "$APP/Contents/Resources/reset-confirmed.caf"
+cp Assets/audio/reset-planned.caf "$APP/Contents/Resources/reset-planned.caf"
 for size in 16 32 128 256 512; do
     sips -s format png -z "$size" "$size" Assets/tibo-avatar.jpg --out "dist/Tibo.iconset/icon_${size}x${size}.png" >/dev/null
     double=$((size * 2))
@@ -20,7 +21,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Tibo Watch</string>
 <key>CFBundleExecutable</key><string>TiboWatch</string>
 <key>CFBundleIconFile</key><string>Tibo</string>
-<key>CFBundleVersion</key><string>7</string>
+<key>CFBundleVersion</key><string>8</string>
 <key>CFBundleShortVersionString</key><string>1.0</string>
 <key>LSUIElement</key><true/>
 <key>LSMinimumSystemVersion</key><string>13.0</string>

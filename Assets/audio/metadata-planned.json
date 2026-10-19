@@ -1,0 +1,13 @@
+{
+  "model": "Audio8-TTS-Preview-0.1B-ONNX-INT8",
+  "voice": "male_bright_synthetic_v2",
+  "reference": "Microsoft zh-CN-YunxiNeural generic synthetic male; rate +8%, pitch +6Hz; generated for this project",
+  "text": "嗨～！我是 Tibo，提前告诉你：Codex 预计要重置啦！具体时间请看文字提醒，目前还没有确认完成哦！",
+  "seconds": 8.288095238095238,
+  "peak": 0.5816017985343933,
+  "rms": 0.06607253104448318,
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "top_k": 50,
+  "seed": 42
+}
