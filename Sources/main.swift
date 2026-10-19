@@ -78,6 +78,71 @@ final class FeedParser: NSObject, XMLParserDelegate {
     }
 }
 
+struct ReminderView: View {
+    let post: Post
+    let count: Int
+    let dismiss: () -> Void
+    private var isTest: Bool { post.id.hasPrefix("test-") }
+    var body: some View {
+        VStack(alignment:.leading,spacing:16) {
+            HStack(spacing:12) {
+                if let url = Bundle.main.url(forResource:"tibo-avatar",withExtension:"jpg"), let avatar = NSImage(contentsOf:url) {
+                    Image(nsImage:avatar).resizable().scaledToFill().frame(width:44,height:44).clipShape(Circle())
+                }
+                VStack(alignment:.leading,spacing:4) {
+                    Text((isTest ? "【测试】" : "") + "Tibo · " + post.kind).font(.title3.weight(.semibold))
+                    Text(isTest ? "模拟提醒 · 并非新的重置消息" : "Codex 额度消息").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Text(post.notificationBody).font(.system(size:14)).fixedSize(horizontal:false,vertical:true).textSelection(.enabled)
+            HStack {
+                Text(count > 1 ? "还有 \(count - 1) 条待查看" : "文字提醒会保留到你关闭").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(count > 1 ? "下一条" : "关闭提醒",action:dismiss).keyboardShortcut(.cancelAction)
+                Button("查看原帖") { NSWorkspace.shared.open(post.url) }
+            }
+        }.padding(24).frame(width:440,alignment:.leading).preferredColorScheme(.light)
+    }
+}
+
+@MainActor final class ReminderPresenter: NSObject, NSWindowDelegate {
+    private var pending: [Post] = []
+    private var panel: NSPanel?
+    var isVisible: Bool { panel?.isVisible ?? false }
+    func show(_ post: Post) {
+        guard !pending.contains(where: { $0.id == post.id }) else { return }
+        pending.append(post)
+        render()
+    }
+    private func render() {
+        guard let post = pending.first else { panel?.orderOut(nil); return }
+        if panel == nil {
+            let window = NSPanel(contentRect:NSRect(x:0,y:0,width:440,height:230),styleMask:[.titled,.closable,.nonactivatingPanel],backing:.buffered,defer:false)
+            window.title = "Tibo 文字提醒"
+            window.level = .floating
+            window.hidesOnDeactivate = false
+            window.isReleasedWhenClosed = false
+            window.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary]
+            window.delegate = self
+            panel = window
+        }
+        guard let panel else { return }
+        panel.contentViewController = NSHostingController(rootView:ReminderView(post:post,count:pending.count,dismiss:{ [weak self] in self?.dismiss() }))
+        if !panel.isVisible {
+            let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+            if let frame = screen?.visibleFrame {
+                panel.setFrameOrigin(NSPoint(x:frame.maxX-panel.frame.width-24,y:frame.maxY-panel.frame.height-24))
+            }
+        }
+        panel.orderFrontRegardless()
+    }
+    private func dismiss() {
+        if !pending.isEmpty { pending.removeFirst() }
+        render()
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { dismiss(); return false }
+}
+
 @MainActor final class Monitor: ObservableObject {
     @Published var posts: [Post] = []
     @Published var message = "等待首次检查"
@@ -94,6 +159,7 @@ final class FeedParser: NSObject, XMLParserDelegate {
         }
     }
     @Published var audioMessage = ""
+    private let reminders = ReminderPresenter()
     private var voiceProcess: Process?
     private var timer: Timer?
     private let defaults = UserDefaults.standard
@@ -131,6 +197,7 @@ final class FeedParser: NSObject, XMLParserDelegate {
         let center = UNUserNotificationCenter.current()
         try await center.add(UNNotificationRequest(identifier:post.id,content:content,trigger:nil))
         let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .authorized { reminders.show(post) }
         if spoken, settings.authorizationStatus == .authorized, settings.soundSetting == .enabled {
             // Use the media output path tested on this Mac. Coalesce simultaneous
             // completion announcements so the same phrase cannot overlap itself.
@@ -166,6 +233,7 @@ final class FeedParser: NSObject, XMLParserDelegate {
         do {
             try await notify(Post(id:identifier, title:"这是一条 Tibo Watch 测试通知，点击可打开 Tibo 主页。",body:"",category:"Reset Completed",date:Date(),url:URL(string:"https://x.com/thsottiaux")!))
             report["submitted"] = true
+            report["textWindowVisible"] = reminders.isVisible
             report["voiceEnabled"] = voiceEnabled
             let playback = voiceProcess
             report["playbackStarted"] = playback?.isRunning ?? false
