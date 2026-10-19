@@ -104,3 +104,13 @@ codesign --verify --deep --strict 'dist/Tibo Watch.app'
 只依据原帖预告，不预测下一次重置。对于原帖“within the next N hours”（1–48 整数小时），以帖子发布时间计算预计窗口上界，显示北京时间；窗口不保证一定兑现。原帖只说 EOD / end of day 时保留“发布当天结束前”和原文 PST 标注，不擅自换成精确时刻或推定夏令时；其他表述提示查看原帖。历史条目首次只建立基线，不重复推送，不把旧预告当作新计划。
 
 生成计划录音：`python scripts/generate-alert.py --kind planned`，再执行 `./scripts/prepare-audio.sh planned`。命令行 `--test-planned-notification` 触发“预计两小时内”的模拟消息，窗口明确标注测试，不代表真实预告。时间转换、模糊时区、冲突分类检查均包含于 `--check-notification-copy`。
+
+### 预计北京时间语音（2026-10-20）
+
+计划提醒的语音现在也读出预计北京时间，不再只说“请看文字提醒”。文字与语音共享 `estimatedResetDate`：语音包含月、日、24 小时制的时、分以及“之前，这是预估窗口，目前还没有确认完成”。对于无法精确换算的 EOD 或未知时间，不猜钟点，而播报“目前无法确定具体北京时间，请查看文字提醒”。
+
+时间语音使用已认可的 Audio8 轻快男声预生成 0–59 和时间短语，共 69 段，存于 `Assets/audio/timebank.json`。应用在本地拼装 PCM WAV，经 afplay 播放；播放结束删除临时文件。日常仍不运行模型、不访问语音服务或消耗 Codex 额度。
+
+重新生成时间库：在 Audio8 环境设置 `AUDIO8_RUNTIME` 后执行 `python scripts/generate-timebank.py`。该脚本复用本项目已注册的男声音色，使用缓存参考前缀与 3 个并行推理任务；无需重新生成已验收的完成录音。
+
+验证：全部 69 段 PCM 的采样率、非空、非静音和字节对齐通过。`--check-notification-copy` 覆盖北京时间文本/语音片段一致性及模糊时区不猜时刻。`--check-time-speech /tmp/time-check.wav` 生成确定的“10月20日 07:45”样例，本地 Whisper 转写正确识别“预计北京时间10月20日7点45分之前”，详见 `Assets/audio/transcript-timebank.json`。

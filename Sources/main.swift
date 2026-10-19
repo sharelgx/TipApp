@@ -19,18 +19,31 @@ struct Post: Codable, Identifiable {
         if isPlanned { return "reset-planned" }
         return isConfirmedCompletion ? "reset-confirmed" : nil
     }
-    var expectedTimeText: String {
+    var estimatedResetDate: Date? {
         let source = body.components(separatedBy:"Source text:").last?.components(separatedBy:"\n\nSource:").first ?? ""
         let pattern = "(?i)\\bwithin\\s+(?:the\\s+next\\s+)?([0-9]{1,2})\\s+hours?\\b"
         let regex = try! NSRegularExpression(pattern:pattern)
         if let match = regex.firstMatch(in:source,range:NSRange(source.startIndex...,in:source)),
            let r = Range(match.range(at:1),in:source), let hours = Int(source[r]), hours > 0, hours <= 48 {
-            let expected = date.addingTimeInterval(Double(hours)*3600)
+            return date.addingTimeInterval(Double(hours)*3600)
+        }
+        return nil
+    }
+    var timeSpeechKeys: [String] {
+        guard let expected = estimatedResetDate else { return ["intro","unknown","end"] }
+        var calendar = Calendar(identifier:.gregorian)
+        calendar.timeZone = TimeZone(identifier:"Asia/Shanghai")!
+        let c = calendar.dateComponents([.month,.day,.hour,.minute],from:expected)
+        return ["intro","beijing",String(c.month!),"month",String(c.day!),"day",String(c.hour!),"hour",String(c.minute!),"minute","before","end"]
+    }
+    var expectedTimeText: String {
+        let source = body.components(separatedBy:"Source text:").last?.components(separatedBy:"\n\nSource:").first ?? ""
+        if let expected = estimatedResetDate {
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier:"zh_CN")
             formatter.timeZone = TimeZone(identifier:"Asia/Shanghai")
             formatter.dateFormat = "M月d日 HH:mm"
-            return "原帖预计发布后 \(hours) 小时内，即北京时间 \(formatter.string(from:expected)) 前；这是预估窗口。"
+            return "原帖预计在北京时间 \(formatter.string(from:expected)) 前重置；这是预估窗口。"
         }
         let lower = source.lowercased()
         if lower.contains("eod") || lower.contains("end of day") {
@@ -100,6 +113,36 @@ final class FeedParser: NSObject, XMLParserDelegate {
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
         guard let date = formatter.date(from: fields["pubDate", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
         posts.append(Post(id: url.absoluteString, title: fields["title", default: ""], body: body, category: fields["category", default:""], date:date, url:url))
+    }
+}
+
+struct TimeSpeechBank: Decodable {
+    let sampleRate: Int
+    let clips: [String:Data]
+    static func render(_ post: Post) throws -> URL {
+        guard let url = Bundle.main.url(forResource:"timebank",withExtension:"json") else {
+            throw NSError(domain:"Speech",code:1,userInfo:[NSLocalizedDescriptionKey:"预计时间语音库缺失"])
+        }
+        let bank = try JSONDecoder().decode(TimeSpeechBank.self,from:Data(contentsOf:url))
+        guard bank.sampleRate == 44100 else { throw NSError(domain:"Speech",code:2) }
+        var pcm = Data()
+        for key in post.timeSpeechKeys {
+            guard let clip = bank.clips[key], !clip.isEmpty, clip.count % 2 == 0 else {
+                throw NSError(domain:"Speech",code:3,userInfo:[NSLocalizedDescriptionKey:"时间语音片段缺失："+key])
+            }
+            pcm.append(clip)
+            pcm.append(Data(repeating:0,count:["intro","before","unknown"].contains(key) ? 17640 : 1764))
+        }
+        guard pcm.count < 8_820_000 else { throw NSError(domain:"Speech",code:4) }
+        var wave = Data("RIFF".utf8)
+        func number<T: FixedWidthInteger>(_ value: T) { var little = value.littleEndian; withUnsafeBytes(of:&little) { wave.append(contentsOf:$0) } }
+        number(UInt32(36+pcm.count)); wave.append(Data("WAVEfmt ".utf8))
+        number(UInt32(16)); number(UInt16(1)); number(UInt16(1))
+        number(UInt32(bank.sampleRate)); number(UInt32(bank.sampleRate*2)); number(UInt16(2)); number(UInt16(16))
+        wave.append(Data("data".utf8)); number(UInt32(pcm.count)); wave.append(pcm)
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent("tibo-plan-"+UUID().uuidString+".wav")
+        try wave.write(to:target,options:.atomic)
+        return target
     }
 }
 
@@ -227,8 +270,9 @@ struct ReminderView: View {
         if spoken, settings.authorizationStatus == .authorized, settings.soundSetting == .enabled {
             // Use the media output path tested on this Mac. Coalesce simultaneous
             // completion announcements so the same phrase cannot overlap itself.
+            let soundKey = post.isPlanned ? post.id : post.announcementSoundName
             if let process = voiceProcess, process.isRunning {
-                if voiceAssetName == post.announcementSoundName { return }
+                if voiceAssetName == soundKey { return }
                 process.terminate()
             }
             guard let name = post.announcementSoundName, let url = Bundle.main.url(forResource:name,withExtension:"caf") else {
@@ -237,11 +281,16 @@ struct ReminderView: View {
             }
             let process = Process()
             process.executableURL = URL(fileURLWithPath:"/usr/bin/afplay")
-            process.arguments = [url.path]
             do {
-                try process.run()
+                let playbackURL = post.isPlanned ? try TimeSpeechBank.render(post) : url
+                process.arguments = [playbackURL.path]
+                if post.isPlanned {
+                    process.terminationHandler = { _ in try? FileManager.default.removeItem(at:playbackURL) }
+                }
+                do { try process.run() }
+                catch { if post.isPlanned { try? FileManager.default.removeItem(at:playbackURL) }; throw error }
                 voiceProcess = process
-                voiceAssetName = post.announcementSoundName
+                voiceAssetName = soundKey
                 audioMessage = ""
             } catch { audioMessage = "中文播报失败：\(error.localizedDescription)" }
         }
@@ -448,9 +497,20 @@ if CommandLine.arguments.contains("--check-notification-copy") {
     let referenceDate = Date(timeIntervalSince1970:0)
     let relative = Post(id:"check",title:"plan",body:"Source text: Landing within the next 2 hours",category:"Reset Planned",date:referenceDate,url:URL(string:"https://x.com/thsottiaux")!)
     precondition(relative.expectedTimeText.contains("1月1日 10:00"))
+    precondition(relative.timeSpeechKeys == ["intro","beijing","1","month","1","day","10","hour","0","minute","before","end"])
     let eod = Post(id:"check",title:"plan",body:"Source text: Landing sometime today by EOD PST",category:"Reset Planned",date:referenceDate,url:relative.url)
     precondition(eod.expectedTimeText.contains("PST") && !eod.expectedTimeText.contains("北京时间"))
+    precondition(eod.timeSpeechKeys == ["intro","unknown","end"])
     print("预计时间转换与模糊时区边界检查通过")
+} else if CommandLine.arguments.contains("--check-time-speech") {
+    let date = ISO8601DateFormatter().date(from:"2026-10-19T21:45:00Z")!
+    let post = Post(id:"check",title:"plan",body:"Source text: Landing within the next 2 hours",category:"Reset Planned",date:date,url:URL(string:"https://x.com/thsottiaux")!)
+    precondition(post.expectedTimeText.contains("10月20日 07:45"))
+    let file = try TimeSpeechBank.render(post)
+    try Data(contentsOf:file).write(to:URL(fileURLWithPath:CommandLine.arguments.last!),options:.atomic)
+    try FileManager.default.removeItem(at:file)
+    print(post.expectedTimeText)
+    print("同一时间结果的语音片段："+post.timeSpeechKeys.joined(separator:","))
 } else if CommandLine.arguments.contains("--check-feed") {
     let data = try Data(contentsOf:URL(fileURLWithPath:CommandLine.arguments.last!))
     let posts = try FeedParser.parse(data)
