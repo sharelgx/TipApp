@@ -17,3 +17,5 @@
 原始波形有限、非静音，峰值约 0.634，无生成 token 截断。CAF/MP3 已完成完整解码检查。主应用使用 afplay 播放本地 CAF，不依赖自定义通知声音，不在日常运行中调用语音模型或云 API。音色轻快程度仍以用户实际试听为准。
 
 脚本见 `scripts/generate-alert.py` 与 `scripts/prepare-audio.sh`。参考文件和注册音色缓存在忽略提交的 `Work/audio/`；模型与虚拟环境不上传仓库。
+
+2026-10-20 验收：更新后的应用发送中文模拟完成通知，系统返回 submitted=true、delivered=true、playbackStarted=true，用户实际反馈“听到了，这版合适”。本次轻快明亮版本已通过用户试听。
