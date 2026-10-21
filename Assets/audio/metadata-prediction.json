@@ -1,0 +1,13 @@
+{
+  "model": "Audio8-TTS-Preview-0.1B-ONNX-INT8",
+  "voice": "male_bright_synthetic_v2",
+  "reference": "Microsoft zh-CN-YunxiNeural generic synthetic male; rate +8%, pitch +6Hz; generated for this project",
+  "text": "嗨！发现 Tibo 的新线索，可能与重置有关。这只是一个猜测，并不确定，目前不知道具体时间，请看文字分析。",
+  "seconds": 8.68328798185941,
+  "peak": 0.5391515493392944,
+  "rms": 0.0570853129029274,
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "top_k": 50,
+  "seed": 42
+}

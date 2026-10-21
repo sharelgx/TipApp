@@ -11,6 +11,10 @@ struct Post: Codable, Identifiable {
     var date: Date
     var url: URL
     var source: String? = nil
+    var predictionReason: String? = nil
+    var predictionConfidence: String? = nil
+    var quotedText: String? = nil
+    var bodyTruncated: Bool? = nil
     var relevant: Bool {
         let text = (title + " " + category).lowercased()
         return text.contains("reset") || text.contains("credit") || text.contains("额度") || text.contains("重置")
@@ -22,8 +26,12 @@ struct Post: Codable, Identifiable {
         formatter.dateFormat = "M月d日 HH:mm"
         return formatter.string(from:date)
     }
+    var isPrediction: Bool { category.lowercased().contains("prediction") }
+    func shouldNotify(forecastsOnly: Bool) -> Bool { isPrediction || isPlanned || (!forecastsOnly && relevant) }
+    var alertKey: String { id+"#"+category.trimmingCharacters(in:.whitespacesAndNewlines) }
     var isPlanned: Bool { category.lowercased().contains("planned") }
     var announcementSoundName: String? {
+        if isPrediction { return "reset-prediction" }
         if isPlanned { return "reset-planned" }
         return isConfirmedCompletion ? "reset-confirmed" : nil
     }
@@ -66,6 +74,9 @@ struct Post: Codable, Identifiable {
     }
     var notificationBody: String {
         let c = category.lowercased()
+        if isPrediction {
+            return "【推测·"+(predictionConfidence ?? "低")+"把握】"+(predictionReason ?? "发现可能与重置有关的线索。")+"\n预计北京时间：无法判断，不能编造钟点。尚无明确预告，也未确认完成。"
+        }
         if c.contains("planned") {
             return "Tibo 预告将重置 Codex 额度，目前尚未确认完成。\n" + expectedTimeText
         }
@@ -79,6 +90,7 @@ struct Post: Codable, Identifiable {
     }
     var kind: String {
         let c = category.lowercased()
+        if isPrediction { return "预测线索（非公告）" }
         if c.contains("planned") { return "计划重置" }
         if c.contains("completed") { return "已宣布完成" }
         if c.contains("bank") || title.lowercased().contains("bank") { return "重置卡消息" }
@@ -227,6 +239,7 @@ struct ReminderView: View {
         pending.append(post)
         render()
     }
+    func removeResolved(_ ids: Set<String>) { pending.removeAll { ids.contains($0.id) }; render() }
     private func render() {
         guard let post = pending.first else { panel?.orderOut(nil); return }
         if panel == nil {
@@ -271,6 +284,12 @@ struct ReminderView: View {
             if !voiceEnabled, let process = voiceProcess, process.isRunning { process.terminate() }
         }
     }
+    @Published var forecastsOnly = UserDefaults.standard.object(forKey:"forecastsOnly") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(forecastsOnly,forKey:"forecastsOnly") }
+    }
+    @Published var directStatus = "X 直连尚未连接，第三方兜底"
+    private var directTriggerAt = Date.distantPast
+    private var alerted: Set<String> = Set(UserDefaults.standard.stringArray(forKey:"alertedSignalKeys") ?? [])
     @Published var audioMessage = ""
     private let reminders = ReminderPresenter()
     private var voiceAssetName: String?
@@ -290,6 +309,12 @@ struct ReminderView: View {
     func start() {
         timer = Timer.scheduledTimer(withTimeInterval:60, repeats:true) { [weak self] _ in Task { @MainActor in await self?.check() } }
         NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.didWakeNotification, object:nil, queue:.main) { [weak self] _ in Task { @MainActor in await self?.check() } }
+        DistributedNotificationCenter.default().addObserver(forName:NSNotification.Name("local.tibowatch.x.changed"),object:nil,queue:.main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, Date().timeIntervalSince(self.directTriggerAt)>10 else{return}
+                self.directTriggerAt=Date();await self.check()
+            }
+        }
         Task { await refreshPermission(); await check() }
     }
     func refreshPermission() async {
@@ -340,7 +365,7 @@ struct ReminderView: View {
             } catch { audioMessage = "中文播报失败：\(error.localizedDescription)" }
         }
     }
-    func test(planned: Bool = false) async {
+    func test(planned: Bool = false, prediction: Bool = false) async {
         await allow()
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
@@ -352,11 +377,16 @@ struct ReminderView: View {
             "soundSetting": settings.soundSetting.rawValue,
             "notificationCenterSetting": settings.notificationCenterSetting.rawValue,
             "alertStyle": settings.alertStyle.rawValue,
-            "kind": planned ? "planned" : "completed",
+            "kind": prediction ? "prediction" : planned ? "planned" : "completed",
             "identifier": identifier
         ]
         do {
-            try await notify(Post(id:identifier, title:"这是一条 Tibo Watch 测试通知，点击可打开 Tibo 主页。",body:planned ? "Source text: Landing within the next 2 hours" : "",category:planned ? "Reset Planned" : "Reset Completed",date:Date(),url:URL(string:"https://x.com/thsottiaux")!))
+            var sample=Post(id:identifier,title:"这是一条模拟通知",body:planned ? "Source text: Landing within the next 2 hours" : "",category:planned ? "Reset Planned" : "Reset Completed",date:Date(),url:URL(string:"https://x.com/thsottiaux")!)
+            if prediction {
+                sample.category="Reset Prediction";sample.predictionConfidence="低"
+                sample.predictionReason="发现 cooked/cooking 双关线索，但也可能只是产品宣传玩笑；没有明确重置承诺。"
+            }
+            try await notify(sample)
             report["submitted"] = true
             report["textWindowVisible"] = reminders.isVisible
             report["voiceEnabled"] = voiceEnabled
@@ -386,6 +416,8 @@ struct ReminderView: View {
             async let primaryResult = fetchSource("https://tibo.modelyard.dev/feed.xml",parser:FeedParser.parse)
             async let backupResult = fetchSource("https://opentherank.com/codex-reset/",parser:BackupParser.parse)
             let (primary,backup) = await (primaryResult,backupResult)
+            let direct=DirectX.load(root:cache.deletingLastPathComponent())
+            directStatus=direct.status
             var merged: [String:Post] = [:]
             var warnings: [String] = []
             switch primary {
@@ -398,36 +430,46 @@ struct ReminderView: View {
                 for post in items where merged[post.id] == nil { merged[post.id] = post; supplementary += 1 }
             case .failure: warnings.append("备用源失败")
             }
+            for post in direct.posts { merged[post.id]=post }
             guard !merged.isEmpty else { throw NSError(domain:"Sources",code:1,userInfo:[NSLocalizedDescriptionKey:"两个消息源均不可用"]) }
             let fresh = merged.values.sorted { $0.date > $1.date }
             posts = fresh
+            reminders.removeResolved(Set(fresh.filter { ForecastEngine.resolved($0,in:fresh) }.map(\.id)))
             var notificationFailed = false
             if initialized {
                 let settings = await UNUserNotificationCenter.current().notificationSettings()
-                for post in fresh.reversed() where !seen.contains(post.id) {
-                    // Backfill recent missing announcements, without alerting years of
-                    // history when the secondary source is first enabled.
-                    if post.source == "OpenTheRank", post.date.timeIntervalSinceNow < -48*3600 {
-                        seen.insert(post.id); continue
-                    }
-                    if post.relevant {
-                        guard settings.authorizationStatus == .authorized else { notificationFailed = true; continue }
-                        do { try await notify(post) } catch { notificationFailed = true; continue }
-                    }
-                    seen.insert(post.id)
+                for post in fresh.reversed() {
+                    if post.date.timeIntervalSinceNow < -48*3600 || (post.isPrediction && post.date.timeIntervalSinceNow < -6*3600) {seen.insert(post.id);continue}
+                    if ForecastEngine.resolved(post,in:fresh) {seen.insert(post.id);continue}
+                    let shouldAlert=post.shouldNotify(forecastsOnly:forecastsOnly)
+                    if !shouldAlert {seen.insert(post.id);continue}
+                    if alerted.contains(post.alertKey) || (seen.contains(post.id) && post.source != "X Direct") {continue}
+                    guard settings.authorizationStatus == .authorized else { notificationFailed=true;continue }
+                    do {
+                        try await notify(post)
+                        alerted.insert(post.alertKey);seen.insert(post.id)
+                        let audit:[String:Any] = ["at":ISO8601DateFormatter().string(from:Date()),"id":post.id,"category":post.category,"source":post.source ?? "unknown","postDate":ISO8601DateFormatter().string(from:post.date),"reason":post.predictionReason ?? "明确预告或启用的结果通知","confidence":post.predictionConfidence ?? "not_applicable"]
+                        let line=try JSONSerialization.data(withJSONObject:audit)
+                        let file=cache.deletingLastPathComponent().appendingPathComponent("prediction-audit.jsonl")
+                        try FileManager.default.createDirectory(at:file.deletingLastPathComponent(),withIntermediateDirectories:true)
+                        if !FileManager.default.fileExists(atPath:file.path){FileManager.default.createFile(atPath:file.path,contents:nil)}
+                        let handle=try FileHandle(forWritingTo:file);try handle.seekToEnd();try handle.write(contentsOf:line+Data([10]));try handle.close()
+                    }catch{notificationFailed=true}
                 }
             } else {
                 // Baseline prevents historical posts from producing an alert storm.
                 seen.formUnion(fresh.map(\.id))
+                alerted.formUnion(fresh.map(\.alertKey))
                 initialized = true
                 defaults.set(true,forKey:"initialized")
             }
             defaults.set(Array(seen),forKey:"seen")
+            defaults.set(Array(alerted),forKey:"alertedSignalKeys")
             try FileManager.default.createDirectory(at:cache.deletingLastPathComponent(),withIntermediateDirectories:true)
             try JSONEncoder().encode(fresh).write(to:cache, options:.atomic)
             checked = Date()
-            message = notificationFailed ? "有新消息待通知，请检查通知权限" : warnings.isEmpty ? "双源检查成功 · 每 60 秒检查" : warnings.joined(separator:"、")+" · 当前为单源检查"
-            let audit: [String:Any] = ["checkedAt":ISO8601DateFormatter().string(from:Date()),"warnings":warnings,"supplementaryPosts":supplementary,"posts":fresh.count]
+            message = notificationFailed ? "有新消息待通知，请检查通知权限" : direct.healthy ? "X 为主 · "+(warnings.isEmpty ? "第三方兜底可用" : warnings.joined(separator:"、")) : direct.status+" · 第三方兜底"
+            let audit: [String:Any] = ["checkedAt":ISO8601DateFormatter().string(from:Date()),"warnings":warnings,"supplementaryPosts":supplementary,"posts":fresh.count,"directStatus":direct.status,"directHealthy":direct.healthy,"directPosts":direct.posts.count]
             try JSONSerialization.data(withJSONObject:audit,options:.prettyPrinted).write(to:cache.deletingLastPathComponent().appendingPathComponent("source-check.json"),options:.atomic)
         } catch { message = "检查失败：\(error.localizedDescription)" }
         await refreshPermission()
@@ -462,20 +504,22 @@ struct Panel: View {
                 if model.busy { ProgressView().controlSize(.small) }
             }
             VStack(alignment:.leading,spacing:5) {
+                Text(model.directStatus).font(.caption).foregroundStyle(.secondary)
                 Label(model.paused ? "监控已暂停" : model.message, systemImage:model.paused ? "pause.circle" : "arrow.clockwise.circle")
                 if let checked = model.checked { Text("最近检查 \(checked.formatted(date:.omitted,time:.standard))").font(.caption).foregroundStyle(.secondary) }
                 Text("通知：\(model.permission)").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
-            HStack { Text("重置与重置卡").font(.headline); Spacer(); Button("检查") { Task { await model.check() } }.disabled(model.busy || model.paused) }
+            HStack { Text(model.forecastsOnly ? "预测与预告" : "重置与重置卡").font(.headline); Spacer(); Button("检查") { Task { await model.check() } }.disabled(model.busy || model.paused) }
             if model.posts.isEmpty {
                 Text("正在连接公开消息源。首次读取只建立基线，之后的新消息才会提醒。").foregroundStyle(.secondary).padding(.vertical,12)
             } else {
                 ScrollView {
                     LazyVStack(alignment:.leading,spacing:16) {
-                        ForEach(model.posts.filter(\.relevant).prefix(30)) { post in
+                        ForEach(model.posts.filter { $0.relevant && (!model.forecastsOnly || $0.isPrediction || $0.isPlanned) }.prefix(30)) { post in
                             VStack(alignment:.leading,spacing:5) {
                                 HStack { Text(post.kind).font(.caption.weight(.semibold)); Spacer(); Text(post.date.formatted(date:.abbreviated,time:.shortened)).font(.caption).foregroundStyle(.secondary) }
+                                if ForecastEngine.resolved(post,in:model.posts) { Text("后续已宣布完成 · 此预警已结束").font(.caption).foregroundStyle(.secondary) }
                                 Text("来源："+(post.source ?? "ModelYard")).font(.caption2).foregroundStyle(.secondary)
                                 Link(post.title,destination:post.url).font(.system(size:13,weight:.medium)).foregroundStyle(.primary).fixedSize(horizontal:false,vertical:true)
                                 if let text = post.body.components(separatedBy:"Source text: ").last, post.body.contains("Source text:") {
@@ -488,7 +532,7 @@ struct Panel: View {
             }
             Divider()
             VStack(alignment:.leading,spacing:4) {
-                Text("来源：ModelYard＋OpenTheRank（第三方交叉检查）").font(.caption)
+                Text("X 直连优先；ModelYard＋OpenTheRank 兜底").font(.caption)
                 if let latest = model.posts.first {
                     Text("源内最新：\(latest.date.formatted(date:.abbreviated,time:.shortened))").font(.caption).foregroundStyle(.secondary)
                     if Date().timeIntervalSince(latest.date) > 86400 {
@@ -499,12 +543,14 @@ struct Panel: View {
             }
             HStack {
                 Menu("测试提醒") {
+                    Button("预测线索（低把握）") { Task { await model.test(prediction:true) } }
                     Button("预计重置（计划）") { Task { await model.test(planned:true) } }
                     Button("已宣布完成") { Task { await model.test() } }
                 }.fixedSize()
                 Button(model.paused ? "继续" : "暂停") { model.paused.toggle(); if !model.paused { Task { await model.check() } } }
                 Spacer()
                 Menu {
+                    Toggle("只提醒预测和预告",isOn:$model.forecastsOnly)
                     Toggle("中文播报（使用媒体音量）",isOn:$model.voiceEnabled)
                     Toggle("登录时启动",isOn:Binding(get:{model.login},set:{model.setLogin($0)}))
                     Button("系统通知设置") { NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.Notifications-Settings.extension")!) }
@@ -543,7 +589,8 @@ struct Panel: View {
         popover.contentViewController = NSHostingController(rootView:Panel(model:model))
         model.start()
         Task {
-            if CommandLine.arguments.contains("--test-planned-notification") { await model.test(planned:true) }
+            if CommandLine.arguments.contains("--test-prediction-notification") { await model.test(prediction:true) }
+            else if CommandLine.arguments.contains("--test-planned-notification") { await model.test(planned:true) }
             else if CommandLine.arguments.contains("--test-notification") { await model.test() }
             else { await model.allow() }
         }
@@ -560,7 +607,25 @@ struct Panel: View {
     }
 }
 
-if CommandLine.arguments.contains("--check-notification-copy") {
+if CommandLine.arguments.contains("--check-forecasts") {
+    func sample(_ text:String,quote:String="",truncated:Bool=false)->DirectPost { DirectPost(url:"https://x.com/thsottiaux/status/12345",date:"2026-10-19T19:45:28.000Z",text:text,quote:quote,truncated:truncated) }
+    let cooked=ForecastEngine.classify(sample("Day 15/ We're cooked",quote:"Here's what we're cooking with Codex"))!
+    precondition(cooked.isPrediction && cooked.predictionConfidence=="低" && cooked.estimatedResetDate==nil)
+    let done=ForecastEngine.classify(sample("Day 15/ Nevermind, we're still cooking... and reset. Enjoy."))!
+    precondition(done.isConfirmedCompletion && !done.isPrediction)
+    precondition(!done.shouldNotify(forecastsOnly:true) && cooked.shouldNotify(forecastsOnly:true))
+    var later=done;later.date=cooked.date.addingTimeInterval(3600)
+    precondition(ForecastEngine.resolved(cooked,in:[cooked,later]))
+    precondition(ForecastEngine.classify(sample("We will reset Codex within the next 2 hours"))!.isPlanned)
+    precondition(ForecastEngine.classify(sample("We will not reset Codex today"))!.category=="Codex Update")
+    precondition(!ForecastEngine.classify(sample("API users can cache for 12 hours"))!.relevant)
+    precondition(ForecastEngine.classify(sample("We will ship an improvement or reset"))!.isPrediction)
+    precondition(!ForecastEngine.classify(sample("We keep caching forever",quote:"Reset is done"))!.isConfirmedCompletion)
+    precondition(ForecastEngine.classify(sample("We will reset soon",truncated:true))!.isPrediction)
+    // Classifying the earlier joke again must not change after seeing completion.
+    precondition(ForecastEngine.classify(sample("Day 15/ We're cooked",quote:"Here's what we're cooking with Codex"))!.category==cooked.category)
+    print("预测边界检查通过：双关=低把握；完成不是预测；否认/引用/折叠/条件承诺不误判为完成")
+} else if CommandLine.arguments.contains("--check-notification-copy") {
     for category in ["Reset Planned", "Reset Completed", "Banked Reset", "Reset Discussion", "Reset Planned Completed"] {
         let post = Post(id:"check",title:category == "Banked Reset" ? "banked" : "update",body:"",category:category,date:Date(),url:URL(string:"https://x.com/thsottiaux")!)
         if category.contains("Planned") { precondition(!post.isConfirmedCompletion && post.notificationBody.contains("尚未确认完成") && post.announcementSoundName == "reset-planned") }

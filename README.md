@@ -1,6 +1,6 @@
 # Tibo Watch
 
-macOS 菜单栏提醒工具，关注 [Tibo / @thsottiaux](https://x.com/thsottiaux) 的 Codex 额度重置及重置卡消息。头像用于应用和菜单栏图标。本项目为非官方个人工具，与 Tibo 或 OpenAI 没有隶属关系；语音为通用 AI 合成男声，不是本人录音。
+macOS 菜单栏提前预警工具，以直接读取 X 为主，第三方来源兜底。关注 [Tibo / @thsottiaux](https://x.com/thsottiaux) 的 Codex 额度重置及重置卡消息。头像用于应用和菜单栏图标。本项目为非官方个人工具，与 Tibo 或 OpenAI 没有隶属关系；语音为通用 AI 合成男声，不是本人录音。
 
 ## 使用
 
@@ -10,6 +10,8 @@ macOS 菜单栏提醒工具，关注 [Tibo / @thsottiaux](https://x.com/thsottia
 ./scripts/build.sh
 open 'dist/Tibo Watch.app'
 ```
+
+X 直连需要先按 [扩展安装说明](BrowserExtension/README.md) 安装本项目 Edge 扩展和本机桥接，并保持浏览器与 X 登录可用。未连接时应用会明确显示第三方兜底。
 
 首次启动请允许通知。点菜单栏头像打开面板，在“测试提醒”中可分别选择“预计重置（计划）”和“已宣布完成”，测试消息标有“【测试】”，不代表发生真实重置。
 
@@ -120,3 +122,23 @@ codesign --verify --deep --strict 'dist/Tibo Watch.app'
 10 月 20 日 14:33（北京时间）的完成公告没有出现在原先唯一使用的 ModelYard RSS，导致应用无法从该源获知。现并行读取 ModelYard 与 [OpenTheRank](https://opentherank.com/codex-reset/)，按 Tibo 原帖 URL 去重，并显示每条公告来源。任一来源失败明确显示单源状态，全部失败显示错误。本地 source-check.json 记录最近一轮检查状态。
 
 备用源仅补提醒近 48 小时未见的公告，更旧历史只建立去重记录。完成文字新增原公告北京时间；本轮已实际补查并显示 10 月 20 日 14:33 的公告。两个来源都是第三方，仍可能迟报、缺失或分类有误，不能保证完整覆盖。这里的“预计”是换算已发布预告，不是事前独立预测；没有可核实预告时不能报出可靠的未来重置时间。详见 [排查记录](docs/verification/missed-reset-20261021.md)。
+
+
+## X 为主与提前预警（当前行为）
+
+默认开启“只提醒预测和预告”：完成公告留在结果记录中，不再自动弹窗或播报；可在齿轮菜单关闭此选项，恢复结果提醒。现有中文文字窗口、轻快男声和北京时间语音保留。“测试提醒”新增“预测线索（低把握）”，模拟通知不是真实预告。
+
+X 直连通过 Edge MV3 扩展读取 Tibo 主页和回复页的可见公开帖子，按作者和原帖 URL 校验。直连数据覆盖同一 URL 的第三方摘要；第三方来源保留补全和降级能力。浏览器关闭、页面未登录或心跳/加载时间过期时，状态明确显示降级，不把旧缓存说成实时。
+
+目前的“梗预测”是透明的规则信号分级，未经概率校准或实盘准确率验证：cooked/cooking 双关、按钮梗、条件性重置只能触发低把握推测，不给虚构百分比或北京时间。原帖正文与引用分开，不用后来完成的事实倒推早先预测。新预警记录首次触发时间和理由到本机 prediction-audit.jsonl；旧帖子回放不算过去的命中。
+
+实际支持与限制、权限及安装步骤见 [BrowserExtension/README.md](BrowserExtension/README.md)。
+
+本机回归检查：
+
+```sh
+'dist/Tibo Watch.app/Contents/MacOS/TiboWatch' --check-forecasts
+/usr/bin/python3 scripts/test-bridge.py
+node --check BrowserExtension/content.js
+node --check BrowserExtension/background.js
+```
