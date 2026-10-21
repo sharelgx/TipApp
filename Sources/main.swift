@@ -10,9 +10,17 @@ struct Post: Codable, Identifiable {
     var category: String
     var date: Date
     var url: URL
+    var source: String? = nil
     var relevant: Bool {
         let text = (title + " " + category).lowercased()
         return text.contains("reset") || text.contains("credit") || text.contains("额度") || text.contains("重置")
+    }
+    var announcementTime: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier:"zh_CN")
+        formatter.timeZone = TimeZone(identifier:"Asia/Shanghai")
+        formatter.dateFormat = "M月d日 HH:mm"
+        return formatter.string(from:date)
     }
     var isPlanned: Bool { category.lowercased().contains("planned") }
     var announcementSoundName: String? {
@@ -62,7 +70,7 @@ struct Post: Codable, Identifiable {
             return "Tibo 预告将重置 Codex 额度，目前尚未确认完成。\n" + expectedTimeText
         }
         if isConfirmedCompletion {
-            return "Tibo 已宣布 Codex 额度重置完成。请查看你的账户确认是否到账，点击可查看原帖。"
+            return "Tibo 已宣布 Codex 额度重置完成。请查看你的账户确认是否到账，点击可查看原帖。\n公告发布时间（北京时间）："+announcementTime
         }
         if c.contains("bank") || title.lowercased().contains("bank") {
             return "Tibo 发布了重置卡相关消息。是否已发放及如何使用，请点击查看原帖；这不代表额度已自动重置。"
@@ -113,6 +121,43 @@ final class FeedParser: NSObject, XMLParserDelegate {
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
         guard let date = formatter.date(from: fields["pubDate", default: ""].trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
         posts.append(Post(id: url.absoluteString, title: fields["title", default: ""], body: body, category: fields["category", default:""], date:date, url:url))
+    }
+}
+
+enum BackupParser {
+    static func matches(_ pattern: String, _ text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern:pattern,options:[.dotMatchesLineSeparators]) else { return [] }
+        return regex.matches(in:text,range:NSRange(text.startIndex...,in:text)).compactMap {
+            guard let range = Range($0.range(at:1),in:text) else { return nil }
+            return String(text[range])
+        }
+    }
+    static func plain(_ text: String) -> String {
+        var value = text.replacingOccurrences(of:"<[^>]+>",with:" ",options:.regularExpression)
+        for (entity,replacement) in [("&amp;","&"),("&#39;","'"),("&apos;","'"),("&quot;","\""),("&lt;","<"),("&gt;",">"),("&nbsp;"," ")] {
+            value = value.replacingOccurrences(of:entity,with:replacement)
+        }
+        return value.trimmingCharacters(in:.whitespacesAndNewlines)
+    }
+    static func parse(_ data: Data) throws -> [Post] {
+        guard let html = String(data:data,encoding:.utf8) else { throw NSError(domain:"BackupFeed",code:1) }
+        var posts: [Post] = []
+        for article in matches("(<article[^>]*class=\"cx-post\"[^>]*>.*?</article>)",html) {
+            guard let tag = matches("(<article[^>]*>)",article).first,
+                  let type = matches("data-type=\"([^\"]+)\"",tag).first,
+                  ["regular","both","banked"].contains(type),
+                  let rawDate = matches("<time[^>]*datetime=\"([^\"]+)\"",article).first,
+                  let quote = matches("<blockquote[^>]*>(.*?)</blockquote>",article).first,
+                  let rawURL = matches("cite=\"(https://x[.]com/thsottiaux/status/[0-9]+)\"",article).first,
+                  let url = URL(string:rawURL) else { continue }
+            let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
+            guard let date = formatter.date(from:rawDate) ?? ISO8601DateFormatter().date(from:rawDate) else { continue }
+            let planned = tag.contains("data-status=\"announced\"")
+            let category = planned ? "Reset Planned" : type == "banked" ? "Banked Reset" : "Reset Completed"
+            posts.append(Post(id:rawURL,title:planned ? "Tibo 发布重置预告" : type == "banked" ? "Tibo 发布重置卡消息" : "Tibo 宣布重置完成",body:"Source text: "+plain(quote)+"\n\nSource: "+rawURL,category:category,date:date,url:url,source:"OpenTheRank"))
+        }
+        guard !posts.isEmpty else { throw NSError(domain:"BackupFeed",code:2,userInfo:[NSLocalizedDescriptionKey:"备用来源结构变化或无有效公告"]) }
+        return posts.sorted { $0.date > $1.date }
     }
 }
 
@@ -338,16 +383,33 @@ struct ReminderView: View {
         busy = true
         defer { busy = false }
         do {
-            var request = URLRequest(url:URL(string:"https://tibo.modelyard.dev/feed.xml")!, cachePolicy:.reloadIgnoringLocalCacheData, timeoutInterval:25)
-            request.setValue("TiboWatch/1.0 (macOS personal RSS reader)", forHTTPHeaderField:"User-Agent")
-            let (data,response) = try await URLSession.shared.data(for:request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { throw NSError(domain:"HTTP",code:1,userInfo:[NSLocalizedDescriptionKey:"消息源暂时不可用"]) }
-            let fresh = try FeedParser.parse(data)
+            async let primaryResult = fetchSource("https://tibo.modelyard.dev/feed.xml",parser:FeedParser.parse)
+            async let backupResult = fetchSource("https://opentherank.com/codex-reset/",parser:BackupParser.parse)
+            let (primary,backup) = await (primaryResult,backupResult)
+            var merged: [String:Post] = [:]
+            var warnings: [String] = []
+            switch primary {
+            case .success(let items): for var post in items { post.source = "ModelYard"; merged[post.id] = post }
+            case .failure: warnings.append("主源失败")
+            }
+            var supplementary = 0
+            switch backup {
+            case .success(let items):
+                for post in items where merged[post.id] == nil { merged[post.id] = post; supplementary += 1 }
+            case .failure: warnings.append("备用源失败")
+            }
+            guard !merged.isEmpty else { throw NSError(domain:"Sources",code:1,userInfo:[NSLocalizedDescriptionKey:"两个消息源均不可用"]) }
+            let fresh = merged.values.sorted { $0.date > $1.date }
             posts = fresh
             var notificationFailed = false
             if initialized {
                 let settings = await UNUserNotificationCenter.current().notificationSettings()
                 for post in fresh.reversed() where !seen.contains(post.id) {
+                    // Backfill recent missing announcements, without alerting years of
+                    // history when the secondary source is first enabled.
+                    if post.source == "OpenTheRank", post.date.timeIntervalSinceNow < -48*3600 {
+                        seen.insert(post.id); continue
+                    }
                     if post.relevant {
                         guard settings.authorizationStatus == .authorized else { notificationFailed = true; continue }
                         do { try await notify(post) } catch { notificationFailed = true; continue }
@@ -364,9 +426,19 @@ struct ReminderView: View {
             try FileManager.default.createDirectory(at:cache.deletingLastPathComponent(),withIntermediateDirectories:true)
             try JSONEncoder().encode(fresh).write(to:cache, options:.atomic)
             checked = Date()
-            message = notificationFailed ? "有新消息待通知，请检查通知权限" : "检查成功 · 每 60 秒检查"
+            message = notificationFailed ? "有新消息待通知，请检查通知权限" : warnings.isEmpty ? "双源检查成功 · 每 60 秒检查" : warnings.joined(separator:"、")+" · 当前为单源检查"
+            let audit: [String:Any] = ["checkedAt":ISO8601DateFormatter().string(from:Date()),"warnings":warnings,"supplementaryPosts":supplementary,"posts":fresh.count]
+            try JSONSerialization.data(withJSONObject:audit,options:.prettyPrinted).write(to:cache.deletingLastPathComponent().appendingPathComponent("source-check.json"),options:.atomic)
         } catch { message = "检查失败：\(error.localizedDescription)" }
         await refreshPermission()
+    }
+    private func fetchSource(_ address: String, parser: (Data) throws -> [Post]) async -> Result<[Post],Error> {
+        do {
+            let request = URLRequest(url:URL(string:address)!,cachePolicy:.reloadIgnoringLocalCacheData,timeoutInterval:25)
+            let (data,response) = try await URLSession.shared.data(for:request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw NSError(domain:"HTTP",code:1) }
+            return .success(try parser(data))
+        } catch { return .failure(error) }
     }
     func setLogin(_ enabled: Bool) {
         do {
@@ -404,6 +476,7 @@ struct Panel: View {
                         ForEach(model.posts.filter(\.relevant).prefix(30)) { post in
                             VStack(alignment:.leading,spacing:5) {
                                 HStack { Text(post.kind).font(.caption.weight(.semibold)); Spacer(); Text(post.date.formatted(date:.abbreviated,time:.shortened)).font(.caption).foregroundStyle(.secondary) }
+                                Text("来源："+(post.source ?? "ModelYard")).font(.caption2).foregroundStyle(.secondary)
                                 Link(post.title,destination:post.url).font(.system(size:13,weight:.medium)).foregroundStyle(.primary).fixedSize(horizontal:false,vertical:true)
                                 if let text = post.body.components(separatedBy:"Source text: ").last, post.body.contains("Source text:") {
                                     Text(text.components(separatedBy:"\n\nSource:")[0]).font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
@@ -415,7 +488,7 @@ struct Panel: View {
             }
             Divider()
             VStack(alignment:.leading,spacing:4) {
-                Text("来源：ModelYard 公开 RSS（第三方）").font(.caption)
+                Text("来源：ModelYard＋OpenTheRank（第三方交叉检查）").font(.caption)
                 if let latest = model.posts.first {
                     Text("源内最新：\(latest.date.formatted(date:.abbreviated,time:.shortened))").font(.caption).foregroundStyle(.secondary)
                     if Date().timeIntervalSince(latest.date) > 86400 {
@@ -511,6 +584,11 @@ if CommandLine.arguments.contains("--check-notification-copy") {
     try FileManager.default.removeItem(at:file)
     print(post.expectedTimeText)
     print("同一时间结果的语音片段："+post.timeSpeechKeys.joined(separator:","))
+} else if CommandLine.arguments.contains("--check-backup") {
+    let posts = try BackupParser.parse(Data(contentsOf:URL(fileURLWithPath:CommandLine.arguments.last!)))
+    precondition(posts.contains { $0.id == "https://x.com/thsottiaux/status/2112432076767289678" && $0.isConfirmedCompletion })
+    precondition(posts.contains { $0.isPlanned && !$0.isConfirmedCompletion })
+    print("备用源解析通过，\(posts.count) 条，最新：\(posts[0].date)；计划/完成区分通过")
 } else if CommandLine.arguments.contains("--check-feed") {
     let data = try Data(contentsOf:URL(fileURLWithPath:CommandLine.arguments.last!))
     let posts = try FeedParser.parse(data)

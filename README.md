@@ -114,3 +114,9 @@ codesign --verify --deep --strict 'dist/Tibo Watch.app'
 重新生成时间库：在 Audio8 环境设置 `AUDIO8_RUNTIME` 后执行 `python scripts/generate-timebank.py`。该脚本复用本项目已注册的男声音色，使用缓存参考前缀与 3 个并行推理任务；无需重新生成已验收的完成录音。
 
 验证：全部 69 段 PCM 的采样率、非空、非静音和字节对齐通过。`--check-notification-copy` 覆盖北京时间文本/语音片段一致性及模糊时区不猜时刻。`--check-time-speech /tmp/time-check.wav` 生成确定的“10月20日 07:45”样例，本地 Whisper 转写正确识别“预计北京时间10月20日7点45分之前”，详见 `Assets/audio/transcript-timebank.json`。
+
+### 漏报修复与双源限制（2026-10-21，当前实现）
+
+10 月 20 日 14:33（北京时间）的完成公告没有出现在原先唯一使用的 ModelYard RSS，导致应用无法从该源获知。现并行读取 ModelYard 与 [OpenTheRank](https://opentherank.com/codex-reset/)，按 Tibo 原帖 URL 去重，并显示每条公告来源。任一来源失败明确显示单源状态，全部失败显示错误。本地 source-check.json 记录最近一轮检查状态。
+
+备用源仅补提醒近 48 小时未见的公告，更旧历史只建立去重记录。完成文字新增原公告北京时间；本轮已实际补查并显示 10 月 20 日 14:33 的公告。两个来源都是第三方，仍可能迟报、缺失或分类有误，不能保证完整覆盖。这里的“预计”是换算已发布预告，不是事前独立预测；没有可核实预告时不能报出可靠的未来重置时间。详见 [排查记录](docs/verification/missed-reset-20261021.md)。
